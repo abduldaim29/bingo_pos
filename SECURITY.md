@@ -2,15 +2,15 @@
 
 ## Reporting a Vulnerability
 
-Jika Anda menemukan kerentanan keamanan di Point of Sales, **jangan buat issue publik**. Kirim laporan langsung ke:
+If you discover a security vulnerability in Point of Sales, **do not create a public issue**. Send your report directly to:
 
-**Email:** aryadptr.developer@gmail.com
+**Email:** abduldaim2002@gmail.com
 
-Laporan akan ditanggapi dalam **maksimal 48 jam**. Kami akan merilis patch sesegera mungkin setelah konfirmasi.
+We will acknowledge reports within **48 hours** and release a patch as soon as possible after confirming the vulnerability.
 
-## Apa yang Dilaporkan
+## What to Report
 
-Kami menerima laporan untuk:
+We accept reports for:
 - XSS (Cross-Site Scripting)
 - CSRF
 - SQL Injection
@@ -19,17 +19,17 @@ Kami menerima laporan untuk:
 - Remote code execution
 - Privilege escalation
 
-## Informasi yang Dibutuhkan
+## Required Information
 
-Sertakan dalam laporan:
-- Versi aplikasi (commit hash atau tag)
-- Langkah-langkah untuk mereproduksi
-- Dampak potensial
-- (Opsional) Saran mitigasi
+Please include the following in your report:
+- Application version (commit hash or tag)
+- Steps to reproduce
+- Potential impact
+- (Optional) Suggested mitigation
 
-## Security Practices di Repo Ini
+## Security Practices in This Repository
 
-| Area | Praktik |
+| Area | Practice |
 |------|---------|
 | Password | Bcrypt hashing |
 | Session | Regenerate after login, absolute lifetime timeout |
