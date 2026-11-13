@@ -37,13 +37,38 @@ class CheckoutService
                 lockForUpdate: true,
             );
 
-            $carts = Cart::with('product.units')
+            if (($ctx->clientUuid === null) !== ($ctx->cartIds === null)) {
+                throw new \LogicException('Offline sync checkout context is incomplete.');
+            }
+
+            $cartQuery = Cart::with('product.units')
                 ->where('cashier_id', $ctx->userId)
-                ->active()
-                ->get();
+                ->active();
+
+            $syncCartIds = null;
+            if ($ctx->cartIds !== null) {
+                $syncCartIds = array_values(array_unique(array_map('intval', $ctx->cartIds)));
+                if ($syncCartIds === [] || count($syncCartIds) !== count($ctx->cartIds)) {
+                    throw new \LogicException('Offline sync cart scope is invalid.');
+                }
+
+                $cartQuery->whereIn('id', $syncCartIds);
+                if ($activeShift->warehouse_id === null) {
+                    $cartQuery->whereNull('warehouse_id');
+                } else {
+                    $cartQuery->where('warehouse_id', $activeShift->warehouse_id);
+                }
+                $cartQuery->lockForUpdate();
+            }
+
+            $carts = $cartQuery->get();
 
             if ($carts->isEmpty()) {
                 abort(422, 'The cart is empty.');
+            }
+
+            if ($syncCartIds !== null && $carts->count() !== count($syncCartIds)) {
+                throw new \LogicException('Offline sync carts do not match the active cashier context.');
             }
 
             $pricingPreview = $this->pricingService->previewCart($carts, $ctx->customer, null, $ctx->outlet);
@@ -102,6 +127,7 @@ class CheckoutService
                 'warehouse_id' => $activeShift->warehouse_id,
                 'customer_id' => $ctx->customer?->id,
                 'invoice' => 'TRX-'.strtoupper(Str::random(10)),
+                'client_uuid' => $ctx->clientUuid,
                 'cash' => $ctx->useTenders ? $tenderCash : $ctx->cashAmount,
                 'change' => $ctx->useTenders ? $tenderChange : max(0, $ctx->cashAmount - $grandTotal),
                 'discount' => $appliedManualDiscount,
@@ -143,7 +169,11 @@ class CheckoutService
                 $activeShift->warehouse_id,
             );
 
-            Cart::where('cashier_id', $ctx->userId)->active()->delete();
+            $cartDeleteQuery = Cart::where('cashier_id', $ctx->userId)->active();
+            if ($syncCartIds !== null) {
+                $cartDeleteQuery->whereIn('id', $syncCartIds);
+            }
+            $cartDeleteQuery->delete();
 
             $this->loyaltyService->finalizeTransaction($transaction, $ctx->customer, $checkoutPreview);
 

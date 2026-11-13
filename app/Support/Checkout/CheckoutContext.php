@@ -28,6 +28,8 @@ class CheckoutContext
         public readonly ?Outlet $outlet,
         public readonly ?int $bankAccountId,
         public readonly ?float $taxRateOverride = null,
+        public readonly ?string $clientUuid = null,
+        public readonly ?array $cartIds = null,
     ) {}
 
     public function isSplit(): bool

@@ -28,8 +28,11 @@ use App\Services\PricingService;
 use App\Services\TransactionTenderService;
 use App\Services\UnitConversionService;
 use App\Support\Checkout\CheckoutContext;
+use App\Support\Checkout\OfflineSyncCheckoutFailed;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -975,6 +978,8 @@ class PosApiController extends Controller
             taxRateOverride: isset($validated['tax_rate_override'])
                 ? (float) $validated['tax_rate_override']
                 : null,
+            clientUuid: $request->attributes->get('offline_sync_client_uuid'),
+            cartIds: $request->attributes->get('offline_sync_cart_ids'),
         );
 
         try {
@@ -1179,10 +1184,22 @@ class PosApiController extends Controller
             ],
         ]);
 
+        $normalizedUuids = array_map(
+            static fn (array $transaction): string => Str::lower($transaction['client_uuid']),
+            $validated['transactions']
+        );
+        if (count($normalizedUuids) !== count(array_unique($normalizedUuids))) {
+            return $this->validationError(
+                ['transactions' => ['Each client_uuid must be unique within the batch.']],
+                'Duplicate client_uuid values are not allowed in one batch.'
+            );
+        }
+
         $results = [];
 
-        foreach ($validated['transactions'] as $payload) {
-            $uuid = $payload['client_uuid'];
+        foreach ($validated['transactions'] as $index => $payload) {
+            $uuid = $normalizedUuids[$index];
+            $payload['client_uuid'] = $uuid;
 
             // Return the existing transaction if this UUID was already synced.
             if ($existing = Transaction::where('client_uuid', $uuid)->first()) {
@@ -1194,6 +1211,11 @@ class PosApiController extends Controller
                 ];
 
                 continue;
+            }
+
+            $precheckBarrier = $request->attributes->get('offline_sync_uuid_precheck_barrier');
+            if (is_callable($precheckBarrier)) {
+                $precheckBarrier($uuid);
             }
 
             $response = $this->syncOne($request, $payload, $uuid);
@@ -1226,19 +1248,15 @@ class PosApiController extends Controller
             ];
         }
 
-        // Rebuild cart rows from offline items and reuse the standard checkout
-        // flow so pricing, stock, and loyalty rules remain consistent.
         try {
-            $shift = $this->cashierShiftService->getActiveShiftForUser(
-                $user->id
-            );
+            return DB::transaction(function () use ($payload, $user, $uuid, $isPayLater) {
+                $shift = $this->cashierShiftService->getActiveShiftForUser($user->id);
 
-            if (! $shift) {
-                return [
-                    'status' => 'failed',
-                    'reason' => 'No active cashier shift. The offline transaction remains queued.',
-                ];
-            }
+                if (! $shift) {
+                    throw new OfflineSyncCheckoutFailed(
+                        'No active cashier shift. The offline transaction remains queued.'
+                    );
+                }
 
             $createdCartIds = [];
 
@@ -1246,12 +1264,9 @@ class PosApiController extends Controller
                 $product = Product::find($item['product_id']);
 
                 if (! $product) {
-                    $this->deleteCarts($createdCartIds);
-
-                    return [
-                        'status' => 'failed',
-                        'reason' => "Product #{$item['product_id']} was not found.",
-                    ];
+                    throw new OfflineSyncCheckoutFailed(
+                        "Product #{$item['product_id']} was not found."
+                    );
                 }
 
                 if ($product->is_composite) {
@@ -1316,11 +1331,12 @@ class PosApiController extends Controller
                 'due_date' => $isPayLater
                     ? ($payload['due_date'] ?? null)
                     : null,
-                'client_uuid' => $uuid,
             ]));
             $checkoutRequest->merge([
                 'tax_rate_override' => $payload['tax_rate_override'] ?? null,
             ]);
+            $checkoutRequest->attributes->set('offline_sync_client_uuid', $uuid);
+            $checkoutRequest->attributes->set('offline_sync_cart_ids', $createdCartIds);
 
             $checkoutRequest->setUserResolver(fn () => $user);
 
@@ -1332,58 +1348,95 @@ class PosApiController extends Controller
             // Decode the checkout response.
             $json = json_decode($response->getContent(), true);
 
-            if ($response->isSuccessful()) {
-                $transactionId = data_get($json, 'data.id');
-
-                if ($transactionId) {
-                    Transaction::whereKey($transactionId)->update([
-                        'client_uuid' => $uuid,
-                    ]);
-                }
-
-                return [
-                    'status' => $response->getStatusCode() === 202
-                        ? 'pending_approval'
-                        : 'synced',
-                    'transaction_id' => $transactionId,
-                    'invoice' => data_get($json, 'data.invoice'),
-                    'grand_total' => (int) data_get(
-                        $json,
-                        'data.grand_total',
-                        0
-                    ),
-                ];
+            if (! $response->isSuccessful()) {
+                throw new OfflineSyncCheckoutFailed(
+                    data_get($json, 'message', 'Checkout failed.')
+                );
             }
 
-            // Remove temporary cart rows if checkout fails.
-            $this->deleteCarts($createdCartIds);
+            $transactionId = data_get($json, 'data.id');
+            $invoice = data_get($json, 'data.invoice');
+            $grandTotal = data_get($json, 'data.grand_total');
+            if (
+                ! is_numeric($transactionId)
+                || (int) $transactionId < 1
+                || ! is_string($invoice)
+                || $invoice === ''
+                || ! is_numeric($grandTotal)
+                || ! Transaction::whereKey((int) $transactionId)
+                    ->where('client_uuid', $uuid)
+                    ->exists()
+            ) {
+                throw new OfflineSyncCheckoutFailed(
+                    'Checkout returned an invalid transaction result.'
+                );
+            }
 
             return [
-                'status' => 'failed',
-                'reason' => data_get(
-                    $json,
-                    'message',
-                    'Checkout failed.'
-                ),
+                'status' => $response->getStatusCode() === 202
+                    ? 'pending_approval'
+                    : 'synced',
+                'transaction_id' => (int) $transactionId,
+                'invoice' => $invoice,
+                'grand_total' => (int) $grandTotal,
             ];
+            });
+        } catch (OfflineSyncCheckoutFailed $e) {
+            return [
+                'status' => 'failed',
+                'reason' => $e->getMessage(),
+            ];
+        } catch (QueryException $e) {
+            if ($this->isClientUuidUniqueViolation($e)) {
+                $existing = Transaction::where('client_uuid', $uuid)->first();
+                if ($existing) {
+                    return [
+                        'status' => 'duplicate',
+                        'transaction_id' => $existing->id,
+                        'invoice' => $existing->invoice,
+                    ];
+                }
+            }
+
+            report($e);
         } catch (\Throwable $e) {
             report($e);
 
             return [
                 'status' => 'failed',
-                'reason' => $e->getMessage(),
+                'reason' => 'Checkout failed. The offline transaction remains queued.',
             ];
         }
+
+        return [
+            'status' => 'failed',
+            'reason' => 'Checkout failed. The offline transaction remains queued.',
+        ];
     }
 
-    /**
-     * Delete temporary cart rows created during offline synchronization.
-     */
-    private function deleteCarts(array $ids): void
+    private function isClientUuidUniqueViolation(QueryException $exception): bool
     {
-        if ($ids !== []) {
-            Cart::whereIn('id', $ids)->delete();
-        }
+        $driver = DB::connection($exception->getConnectionName())->getDriverName();
+        $errorInfo = $exception->errorInfo ?? [];
+        $sqlState = (string) ($errorInfo[0] ?? $exception->getCode());
+        $vendorCode = (int) ($errorInfo[1] ?? 0);
+        $message = (string) ($errorInfo[2] ?? $exception->getPrevious()?->getMessage() ?? '');
+        $indexName = 'transactions_client_uuid_unique';
+
+        return match ($driver) {
+            'mysql', 'mariadb' => $sqlState === '23000'
+                && $vendorCode === 1062
+                && preg_match('/for key [\'`"](?:[^\'`"]*\\.)?'.preg_quote($indexName, '/').'[\'`"]/i', $message) === 1,
+            'pgsql' => $sqlState === '23505'
+                && preg_match('/unique constraint [\'`"]'.preg_quote($indexName, '/').'[\'`"]/i', $message) === 1,
+            'sqlite' => $sqlState === '23000'
+                && $vendorCode === 19
+                && trim($message) === 'UNIQUE constraint failed: transactions.client_uuid',
+            'sqlsrv' => $sqlState === '23000'
+                && in_array($vendorCode, [2601, 2627], true)
+                && preg_match('/[\'`"]'.preg_quote($indexName, '/').'[\'`"]/i', $message) === 1,
+            default => false,
+        };
     }
 
     /**

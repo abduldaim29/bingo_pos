@@ -1,0 +1,139 @@
+name: POS sync PostgreSQL concurrency
+
+on:
+  pull_request:
+    paths:
+      - app/Models/**
+      - app/Models/CashierShift.php
+      - app/Models/LoyaltyPointHistory.php
+      - app/Models/Receivable.php
+      - app/Models/TransactionDetail.php
+      - app/Http/Controllers/Api/PosApiController.php
+      - app/Services/**
+      - app/Services/CashierShiftService.php
+      - app/Services/LoyaltyService.php
+      - app/Support/Checkout/**
+      - config/**
+      - bootstrap/app.php
+      - database/factories/**
+      - database/migrations/**
+      - phpunit.xml
+      - routes/api.php
+      - tests/Feature/Api/PosTransactionSyncConcurrencyTest.php
+      - tests/Support/**
+      - tests/TestCase.php
+      - .github/workflows/pos-sync-concurrency.yml
+      - composer.json
+      - composer.lock
+  push:
+    paths:
+      - app/Models/**
+      - app/Models/CashierShift.php
+      - app/Models/LoyaltyPointHistory.php
+      - app/Models/Receivable.php
+      - app/Models/TransactionDetail.php
+      - app/Http/Controllers/Api/PosApiController.php
+      - app/Services/**
+      - app/Services/CashierShiftService.php
+      - app/Services/LoyaltyService.php
+      - app/Support/Checkout/**
+      - config/**
+      - bootstrap/app.php
+      - database/factories/**
+      - database/migrations/**
+      - phpunit.xml
+      - routes/api.php
+      - tests/Feature/Api/PosTransactionSyncConcurrencyTest.php
+      - tests/Support/**
+      - tests/TestCase.php
+      - .github/workflows/pos-sync-concurrency.yml
+      - composer.json
+      - composer.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pos-sync-concurrency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: pos_sync_bootstrap
+          POSTGRES_PASSWORD: pos-sync-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pos_sync_bootstrap -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: testing
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      LOG_CHANNEL: stderr
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: bcmath, gd, intl, mbstring, pdo_pgsql, zip
+          coverage: none
+
+      - name: Generate per-run PostgreSQL test credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_database="bingopos_pos_sync_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          test_password="$(openssl rand -hex 32)"
+          echo "::add-mask::${test_password}"
+          {
+            printf 'DB_CONNECTION=pgsql\n'
+            printf 'DB_HOST=127.0.0.1\n'
+            printf 'DB_PORT=5432\n'
+            printf 'DB_DATABASE=%s\n' "$test_database"
+            printf 'DB_USERNAME=pos_sync_test\n'
+            printf 'DB_PASSWORD=%s\n' "$test_password"
+            printf 'DB_URL=pgsql://pos_sync_test:%s@127.0.0.1:5432/%s?sslmode=prefer\n' "$test_password" "$test_database"
+          } >> "$GITHUB_ENV"
+
+      # The PostgreSQL service is disposable; the application role is never the bootstrap superuser.
+      - name: Create restricted role and disposable database
+        shell: bash
+        env:
+          PGPASSWORD: pos-sync-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 \
+            -h 127.0.0.1 -p 5432 -U pos_sync_bootstrap -d postgres \
+            -v role_password="$DB_PASSWORD" \
+            -v database_name="$DB_DATABASE" <<'SQL'
+          REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;
+          REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;
+          SELECT format(
+            'CREATE ROLE pos_sync_test LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
+            :'role_password'
+          ) \gexec
+          SELECT format('CREATE DATABASE %I OWNER pos_sync_test', :'database_name') \gexec
+          SELECT format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', :'database_name') \gexec
+          SELECT format(
+            'GRANT CONNECT, TEMPORARY ON DATABASE %I TO pos_sync_test',
+            :'database_name'
+          ) \gexec
+          SQL
+
+      - name: Install locked Composer dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Provision schema in disposable PostgreSQL service
+        run: php artisan migrate --database=pgsql --force
+
+      - name: Run isolated PostgreSQL concurrency tests
+        run: vendor/bin/phpunit --configuration=phpunit.xml tests/Feature/Api/PosTransactionSyncConcurrencyTest.php
