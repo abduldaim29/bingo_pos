@@ -557,8 +557,66 @@ class PosTransactionSyncConcurrencyTest extends TestCase
 
         $identity = $database->selectOne(
             'SELECT current_database() AS database_name, current_user AS database_user, '
-            .'inet_server_addr()::text AS server_address, inet_server_port() AS server_port'
+            .'inet_server_addr()::text AS server_address, inet_server_port() AS server_port, '
+            .'inet_client_addr()::text AS client_address, inet_client_port() AS client_port, '
+            ."current_setting('port') AS configured_server_port, "
+            ."current_setting('listen_addresses') AS listen_addresses"
         );
+
+        [$addressFamily, $addressClassification] = $this->classifyServiceAddress(
+            $identity->server_address
+        );
+        $serverAddressIsNull = $identity->server_address === null;
+        $serverPortIsNull = $identity->server_port === null;
+        $clientAddressIsNull = $identity->client_address === null;
+        $clientPortIsNull = $identity->client_port === null;
+        $transportIndicator = $serverAddressIsNull && $serverPortIsNull
+            && $clientAddressIsNull && $clientPortIsNull
+                ? 'UNIX_SOCKET_INDICATED'
+                : (! $serverAddressIsNull && ! $serverPortIsNull
+                    && ! $clientAddressIsNull && ! $clientPortIsNull
+                        ? 'TCP_INDICATED'
+                        : 'INCONSISTENT_OR_UNKNOWN');
+        $configuredHost = $database->getConfig('host');
+        if (is_string($configuredHost)) {
+            [$hostFamily, $hostClassification] = $this->classifyServiceAddress($configuredHost);
+            $hostClassification = $hostClassification === 'INVALID_OR_NULL'
+                ? 'NON_IP_OR_UNCLASSIFIED'
+                : $hostFamily.'/'.$hostClassification;
+        } else {
+            $hostClassification = $configuredHost === null ? 'NOT_CONFIGURED' : 'NON_STRING';
+        }
+
+        $listenAddressClassifications = [];
+        foreach (explode(',', (string) $identity->listen_addresses) as $listenAddress) {
+            $listenAddress = trim($listenAddress);
+            if ($listenAddress === '*') {
+                $listenAddressClassifications[] = 'ALL_INTERFACES';
+                continue;
+            }
+
+            [$listenFamily, $listenClassification] = $this->classifyServiceAddress($listenAddress);
+            $listenAddressClassifications[] = $listenClassification === 'INVALID_OR_NULL'
+                ? 'NON_IP_OR_UNCLASSIFIED'
+                : $listenFamily.'/'.$listenClassification;
+        }
+
+        fwrite(STDERR, 'PostgreSQL connection diagnostic: '.json_encode([
+            'server_address_family' => $addressFamily,
+            'server_address_classification' => $addressClassification,
+            'server_address_is_null' => $serverAddressIsNull,
+            'server_port_is_null' => $serverPortIsNull,
+            'server_port' => $serverPortIsNull ? null : (int) $identity->server_port,
+            'client_address_is_null' => $clientAddressIsNull,
+            'client_port_is_null' => $clientPortIsNull,
+            'configured_server_port' => (string) $identity->configured_server_port,
+            'listen_address_classifications' => $listenAddressClassifications,
+            'transport_indicator' => $transportIndicator,
+            'laravel_driver' => $database->getConfig('driver'),
+            'laravel_host_classification' => $hostClassification,
+            'laravel_port' => (string) $database->getConfig('port'),
+        ], JSON_UNESCAPED_SLASHES).PHP_EOL);
+
         $this->assertSame($expectedDatabase, $identity->database_name);
         $this->assertSame('pos_sync_test', $identity->database_user);
         $this->assertSame('5432', (string) $identity->server_port);
@@ -592,13 +650,6 @@ class PosTransactionSyncConcurrencyTest extends TestCase
             ."AND has_database_privilege(current_user, datname, 'CONNECT')"
         );
         $this->assertSame([], $otherDatabaseAccess);
-
-        [$addressFamily, $addressClassification] = $this->classifyServiceAddress(
-            $identity->server_address
-        );
-
-        fwrite(STDERR, "Isolated PostgreSQL server address family: {$addressFamily}\n");
-        fwrite(STDERR, "Isolated PostgreSQL service address classification: {$addressClassification}\n");
 
         $this->assertNotSame(
             'LOOPBACK',
