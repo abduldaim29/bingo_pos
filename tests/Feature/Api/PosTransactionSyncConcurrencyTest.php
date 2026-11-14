@@ -80,6 +80,27 @@ class PosTransactionSyncConcurrencyTest extends TestCase
         ] as $address) {
             $this->assertFalse($this->isPrivateServiceAddress($address), $address);
         }
+
+        foreach ([
+            ['10.20.30.40', 'IPv4', 'RFC1918'],
+            ['::ffff:172.18.0.2', 'IPv6', 'RFC1918'],
+            ['fd12:3456:789a::1', 'IPv6', 'ULA'],
+            ['127.42.0.1', 'IPv4', 'LOOPBACK'],
+            ['::1', 'IPv6', 'LOOPBACK'],
+            ['::ffff:127.0.0.1', 'IPv6', 'LOOPBACK'],
+            ['169.254.1.1', 'IPv4', 'LINK_LOCAL'],
+            ['fe80::1', 'IPv6', 'LINK_LOCAL'],
+            ['8.8.8.8', 'IPv4', 'PUBLIC_OR_OTHER'],
+            ['2001:4860:4860::8888', 'IPv6', 'PUBLIC_OR_OTHER'],
+            ['not-an-ip', 'UNKNOWN', 'INVALID_OR_NULL'],
+            [null, 'UNKNOWN', 'INVALID_OR_NULL'],
+        ] as [$address, $expectedFamily, $expectedClassification]) {
+            $this->assertSame(
+                [$expectedFamily, $expectedClassification],
+                $this->classifyServiceAddress($address),
+                is_string($address) ? $address : 'null'
+            );
+        }
     }
 
     public function test_two_concurrent_sync_requests_with_the_same_uuid_commit_one_sale(): void
@@ -541,11 +562,6 @@ class PosTransactionSyncConcurrencyTest extends TestCase
         $this->assertSame($expectedDatabase, $identity->database_name);
         $this->assertSame('pos_sync_test', $identity->database_user);
         $this->assertSame('5432', (string) $identity->server_port);
-        $this->assertNotSame('127.0.0.1', $identity->server_address);
-        $this->assertTrue(
-            $this->isPrivateServiceAddress($identity->server_address),
-            'The PostgreSQL service address must be private IPv4 or unique-local IPv6.'
-        );
 
         $role = $database->selectOne(
             'SELECT CASE WHEN rolcanlogin THEN 1 ELSE 0 END AS can_login, '
@@ -577,17 +593,84 @@ class PosTransactionSyncConcurrencyTest extends TestCase
         );
         $this->assertSame([], $otherDatabaseAccess);
 
-        $packedServerAddress = inet_pton($identity->server_address);
-        $this->assertNotFalse($packedServerAddress);
-        $addressFamily = strlen($packedServerAddress) === 4 ? 'IPv4' : 'IPv6';
-        $isIpv4MappedAddress = strlen($packedServerAddress) === 16
-            && substr($packedServerAddress, 0, 12) === str_repeat("\0", 10)."\xff\xff";
-        $addressClassification = strlen($packedServerAddress) === 4 || $isIpv4MappedAddress
-            ? 'RFC1918'
-            : 'ULA';
+        [$addressFamily, $addressClassification] = $this->classifyServiceAddress(
+            $identity->server_address
+        );
 
         fwrite(STDERR, "Isolated PostgreSQL server address family: {$addressFamily}\n");
         fwrite(STDERR, "Isolated PostgreSQL service address classification: {$addressClassification}\n");
+
+        $this->assertNotSame(
+            'LOOPBACK',
+            $addressClassification,
+            'The PostgreSQL service address must not be loopback.'
+        );
+        $this->assertTrue(
+            $this->isPrivateServiceAddress($identity->server_address),
+            'The PostgreSQL service address must be private IPv4 or unique-local IPv6.'
+        );
+    }
+
+    private function classifyServiceAddress(?string $address): array
+    {
+        if ($address === null) {
+            return ['UNKNOWN', 'INVALID_OR_NULL'];
+        }
+
+        $packedAddress = inet_pton($address);
+        if ($packedAddress === false) {
+            return ['UNKNOWN', 'INVALID_OR_NULL'];
+        }
+
+        $addressFamily = strlen($packedAddress) === 4 ? 'IPv4' : 'IPv6';
+        if (
+            strlen($packedAddress) === 16
+            && substr($packedAddress, 0, 12) === str_repeat("\0", 10)."\xff\xff"
+        ) {
+            $packedAddress = substr($packedAddress, 12);
+        }
+
+        if (strlen($packedAddress) === 4) {
+            $firstOctet = ord($packedAddress[0]);
+            $secondOctet = ord($packedAddress[1]);
+
+            if (
+                $firstOctet === 10
+                || ($firstOctet === 172 && $secondOctet >= 16 && $secondOctet <= 31)
+                || ($firstOctet === 192 && $secondOctet === 168)
+            ) {
+                return [$addressFamily, 'RFC1918'];
+            }
+
+            if ($firstOctet === 127) {
+                return [$addressFamily, 'LOOPBACK'];
+            }
+
+            if ($firstOctet === 169 && $secondOctet === 254) {
+                return [$addressFamily, 'LINK_LOCAL'];
+            }
+
+            return [$addressFamily, 'PUBLIC_OR_OTHER'];
+        }
+
+        if (strlen($packedAddress) === 16) {
+            if ($packedAddress === str_repeat("\0", 15)."\x01") {
+                return [$addressFamily, 'LOOPBACK'];
+            }
+
+            if (
+                ord($packedAddress[0]) === 0xfe
+                && (ord($packedAddress[1]) & 0xc0) === 0x80
+            ) {
+                return [$addressFamily, 'LINK_LOCAL'];
+            }
+
+            if ((ord($packedAddress[0]) & 0xfe) === 0xfc) {
+                return [$addressFamily, 'ULA'];
+            }
+        }
+
+        return [$addressFamily, 'PUBLIC_OR_OTHER'];
     }
 
     private function isPrivateServiceAddress(?string $address): bool
