@@ -557,7 +557,7 @@ class PosTransactionSyncConcurrencyTest extends TestCase
 
         $identity = $database->selectOne(
             'SELECT current_database() AS database_name, current_user AS database_user, '
-            .'inet_server_addr()::text AS server_address, inet_server_port() AS server_port, '
+            .'host(inet_server_addr()) AS server_address, inet_server_port() AS server_port, '
             .'inet_client_addr()::text AS client_address, inet_client_port() AS client_port, '
             ."current_setting('port') AS configured_server_port, "
             ."current_setting('listen_addresses') AS listen_addresses"
