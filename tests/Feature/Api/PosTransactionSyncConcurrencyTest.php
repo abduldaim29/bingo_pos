@@ -48,6 +48,40 @@ class PosTransactionSyncConcurrencyTest extends TestCase
         $this->createFixtures();
     }
 
+    public function test_service_address_validation_accepts_only_private_ipv4_and_ipv6_addresses(): void
+    {
+        foreach ([
+            '10.20.30.40',
+            '172.18.0.2',
+            '192.168.1.10',
+            'fc00::1',
+            'fd12:3456:789a::1',
+            '::ffff:172.18.0.2',
+        ] as $address) {
+            $this->assertTrue($this->isPrivateServiceAddress($address), $address);
+        }
+
+        foreach ([
+            'not-an-ip',
+            '8.8.8.8',
+            '2001:4860:4860::8888',
+            '0.0.0.0',
+            '100.64.0.1',
+            '192.0.2.1',
+            '2001:db8::1',
+            '169.254.1.1',
+            '127.0.0.1',
+            '127.42.0.1',
+            '::',
+            '::1',
+            '::ffff:127.0.0.1',
+            '::ffff:8.8.8.8',
+            'fe80::1',
+        ] as $address) {
+            $this->assertFalse($this->isPrivateServiceAddress($address), $address);
+        }
+    }
+
     public function test_two_concurrent_sync_requests_with_the_same_uuid_commit_one_sale(): void
     {
         $uuid = 'e3a6935e-f27b-458e-b643-fbc312d1df48';
@@ -508,16 +542,10 @@ class PosTransactionSyncConcurrencyTest extends TestCase
         $this->assertSame('pos_sync_test', $identity->database_user);
         $this->assertSame('5432', (string) $identity->server_port);
         $this->assertNotSame('127.0.0.1', $identity->server_address);
-        $this->assertNotFalse(filter_var(
-            $identity->server_address,
-            FILTER_VALIDATE_IP,
-            FILTER_FLAG_IPV4
-        ));
-        $this->assertFalse(filter_var(
-            $identity->server_address,
-            FILTER_VALIDATE_IP,
-            FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-        ));
+        $this->assertTrue(
+            $this->isPrivateServiceAddress($identity->server_address),
+            'The PostgreSQL service address must be private IPv4 or unique-local IPv6.'
+        );
 
         $role = $database->selectOne(
             'SELECT CASE WHEN rolcanlogin THEN 1 ELSE 0 END AS can_login, '
@@ -548,6 +576,52 @@ class PosTransactionSyncConcurrencyTest extends TestCase
             ."AND has_database_privilege(current_user, datname, 'CONNECT')"
         );
         $this->assertSame([], $otherDatabaseAccess);
+
+        $packedServerAddress = inet_pton($identity->server_address);
+        $this->assertNotFalse($packedServerAddress);
+        $addressFamily = strlen($packedServerAddress) === 4 ? 'IPv4' : 'IPv6';
+        $isIpv4MappedAddress = strlen($packedServerAddress) === 16
+            && substr($packedServerAddress, 0, 12) === str_repeat("\0", 10)."\xff\xff";
+        $addressClassification = strlen($packedServerAddress) === 4 || $isIpv4MappedAddress
+            ? 'RFC1918'
+            : 'ULA';
+
+        fwrite(STDERR, "Isolated PostgreSQL server address family: {$addressFamily}\n");
+        fwrite(STDERR, "Isolated PostgreSQL service address classification: {$addressClassification}\n");
+    }
+
+    private function isPrivateServiceAddress(?string $address): bool
+    {
+        if ($address === null) {
+            return false;
+        }
+
+        $packedAddress = inet_pton($address);
+        if ($packedAddress === false) {
+            return false;
+        }
+
+        if (
+            strlen($packedAddress) === 16
+            && substr($packedAddress, 0, 12) === str_repeat("\0", 10)."\xff\xff"
+        ) {
+            $packedAddress = substr($packedAddress, 12);
+        }
+
+        if (strlen($packedAddress) === 4) {
+            $firstOctet = ord($packedAddress[0]);
+            $secondOctet = ord($packedAddress[1]);
+
+            return $firstOctet === 10
+                || ($firstOctet === 172 && $secondOctet >= 16 && $secondOctet <= 31)
+                || ($firstOctet === 192 && $secondOctet === 168);
+        }
+
+        if (strlen($packedAddress) === 16) {
+            return (ord($packedAddress[0]) & 0xfe) === 0xfc;
+        }
+
+        return false;
     }
 
     private function createFixtures(): void

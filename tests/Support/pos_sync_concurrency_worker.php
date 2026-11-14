@@ -132,12 +132,7 @@ function assertDisposableWorkerDatabase(): void
         || $identity->database_user !== 'pos_sync_test'
         || (string) $identity->server_port !== '5432'
         || $identity->server_address === '127.0.0.1'
-        || filter_var($identity->server_address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false
-        || filter_var(
-            $identity->server_address,
-            FILTER_VALIDATE_IP,
-            FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-        ) !== false
+        || ! isPrivateServiceAddress($identity->server_address)
     ) {
         throw new RuntimeException('The worker connection is not the isolated PostgreSQL service.');
     }
@@ -179,4 +174,38 @@ function assertDisposableWorkerDatabase(): void
     if ($otherDatabaseAccess !== []) {
         throw new RuntimeException('The worker role can connect to a database outside the test target.');
     }
+}
+
+function isPrivateServiceAddress(?string $address): bool
+{
+    if ($address === null) {
+        return false;
+    }
+
+    $packedAddress = inet_pton($address);
+    if ($packedAddress === false) {
+        return false;
+    }
+
+    if (
+        strlen($packedAddress) === 16
+        && substr($packedAddress, 0, 12) === str_repeat("\0", 10)."\xff\xff"
+    ) {
+        $packedAddress = substr($packedAddress, 12);
+    }
+
+    if (strlen($packedAddress) === 4) {
+        $firstOctet = ord($packedAddress[0]);
+        $secondOctet = ord($packedAddress[1]);
+
+        return $firstOctet === 10
+            || ($firstOctet === 172 && $secondOctet >= 16 && $secondOctet <= 31)
+            || ($firstOctet === 192 && $secondOctet === 168);
+    }
+
+    if (strlen($packedAddress) === 16) {
+        return (ord($packedAddress[0]) & 0xfe) === 0xfc;
+    }
+
+    return false;
 }
