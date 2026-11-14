@@ -122,7 +122,7 @@ function assertDisposableWorkerDatabase(): void
     $database = DB::connection('pgsql');
     $identity = $database->selectOne(
         'SELECT current_database() AS database_name, current_user AS database_user, '
-        .'inet_server_addr()::text AS server_address, inet_server_port() AS server_port'
+        .'host(inet_server_addr()) AS server_address, inet_server_port() AS server_port'
     );
 
     if (
